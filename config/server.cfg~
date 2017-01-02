@@ -1,3 +1,4 @@
 path=../sdir
 account_path=../config/account
-thread_num=5
+thread_num=3
+run_path=/nfs/course/select/b04705018/桌面/MP/MP5/MP4/pid

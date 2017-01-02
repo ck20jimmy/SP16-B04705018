@@ -18,6 +18,10 @@
 #include<linux/fcntl.h>
 #include<hash.h>
 #include<pthread.h>
+#include<unistd.h>
+#include<sys/stat.h>
+#include<signal.h>
+
 
 static int parse_arg(csiebox_server* server, int argc, char** argv);
 void* handle_request( void* argp );
@@ -64,6 +68,8 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER ;
 threadpool* t_pool = NULL ;
 
+char fifo[PATH_MAX] = {0};
+
 //read config file, and start to listen
 void csiebox_server_init(
 		csiebox_server** server, int argc, char** argv) {
@@ -95,14 +101,126 @@ void csiebox_server_init(
 	memset(tmp->client, 0, sizeof(csiebox_client_info*) * getdtablesize());
 	tmp->listen_fd = fd;
 	*server = tmp;
+	// detach
+	pid_t process_id ;
+	pid_t sid ;
+	
+	process_id = fork();
+	
+	if(process_id  > 0 ){
+		//mod csiebox_server.pid
+		char file[PATH_MAX] = {0};
+		strcat(file,(*server)->arg.run_path );
+		strcat(file,"/");
+		strcat(file,"csiebox_server.pid");
+		//fprintf(stderr,"%s\n",file);
+		FILE* pfp ;
+		if( !( pfp = fopen(file,"w") ) ){
+			fprintf(stderr,"fail to open file");
+		}
+		char pid[20] = {0};
+		sprintf( pid,"%d" ,(int)process_id);
+		
+		fwrite( pid, sizeof(char), strlen(pid), pfp );
+		fclose(pfp);
+		
+		exit(0);
+	}
+	
+	if( process_id < 0 )
+		exit(1);
+	
+	umask(0);
+	
+	sid = setsid();
+	
+	if( sid < 0 )
+		exit(1);
+	
+	//redirect stderr to output.txt
+	char out[PATH_MAX] = {0};
+	strcat( out, (*server)->arg.run_path );
+	strcat(out,"/");
+	strcat( out, "output.txt" );
+	FILE* fp = fopen( out, "w" );
+	
+	dup2( fileno(fp),STDERR_FILENO );
+	fclose(fp);
+	close(STDIN_FILENO);
+	
+	//make fifo
+	strcat(fifo, (*server)->arg.run_path);
+	strcat(fifo,"/");
+	strcat(fifo, "csiebox_server." );
+	char pid[PATH_MAX] = {0};
+	int p = (int)getpid() ;
+	sprintf(pid,"%d",p);
+	strcat(fifo,pid);
+	
+	fprintf(stderr,"%s\n",fifo);
+	mkfifo(fifo,S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH );
 	
 }
+
+static void sig_term( int signo ){
+	//delete fifo
+	remove(fifo);
+	
+	//stop all the thread
+	
+	
+	fprintf( stderr,"catch SIGTERM\n"  );
+	
+	exit(0);
+}
+static void sig_int( int signo ){
+	//delete fifo
+	remove(fifo);
+	
+	//stop all the thread
+	
+	fprintf(stderr,"catch SIGINT\n");
+	
+	exit(0);
+}
+
+static void sig_usr1(int signo){
+	int fd = open(fifo,O_WRONLY);
+	uint32_t threadcount = t_pool->count ;
+	threadcount = htonl(threadcount);
+	write(fd,&threadcount, sizeof(uint32_t));
+	close(fd) ;
+}
+
 
 //wait client to connect and handle requests from connected socket fd
 //===============================
 //		TODO: you need to modify code in here and handle_request() to support I/O multiplexing
 //===============================
 int csiebox_server_run(csiebox_server* server ) {
+	//fprintf(stderr,"%s\n",server->arg.run_path) ;
+	
+	//set signal handler
+	struct sigaction terminate ;
+	memset(&terminate,0,sizeof(terminate));
+	terminate.sa_handler = &sig_term ;
+	sigaddset( &terminate.sa_mask, SIGUSR1 );
+	
+	struct sigaction usr1 ;
+	memset(&usr1,0,sizeof(usr1));
+	usr1.sa_handler = &sig_usr1 ;
+	usr1.sa_flags = SA_RESTART ;
+	
+	struct sigaction sigint ;
+	memset(&sigint,0,sizeof(sigint));
+	sigint.sa_handler = &sig_int ;
+	
+	
+	sigaction(SIGINT,&sigint,NULL);
+	sigaction( SIGTERM,&terminate,NULL );
+	
+	
+	
 	int conn_fd, conn_len;
 	struct sockaddr_in addr;
 	int fdmax ;
@@ -129,33 +247,44 @@ int csiebox_server_run(csiebox_server* server ) {
 	for(int i = 0 ; i < t_pool->threadnum ; i++)
 		pthread_create( &t_pool->threads[i], NULL, handle_request, t_pool->argp ) ;
 	
-	//fprintf(stderr,"%d\n",t_pool->argp[1].conn_fd);
 	
-
-	//fprintf(stderr,"%d\n",server->arg.thread_num);
+	// catch SIGUSR1
+	sigaction( SIGUSR1,&usr1,NULL );
+	
+	//block SIGUSR1 when select
+	sigset_t newmask;
+	sigemptyset(&newmask);
+	sigaddset(&newmask,SIGUSR1);
 	
 	while (1) {
+		
+		if( sigprocmask( SIG_BLOCK, &newmask, NULL ) != 0 ){
+			fprintf(stderr,"fail to set signal mask\n");
+		}
+
 		memset(&addr, 0, sizeof(addr));
 		conn_len = 0 ;
 		// waiting client connect
 		read_fds = master ;
-		
+
 		struct timeval time;
 		memset(&time,0,sizeof(time));
 
 		time.tv_sec = 3 ;
-		
+
 		if( select(fdmax+1,&read_fds,NULL,NULL,&time  ) == -1 ){
 			perror("select") ;
 			exit(4) ;
 		}
+		
+		sigprocmask( SIG_UNBLOCK, &newmask, NULL );
 		
 		for( int i = 0 ; i <= fdmax ; i++ ){
 			if( FD_ISSET(i,&read_fds) ){
 				if( i == server->listen_fd ){
 					conn_fd = accept(
 							server->listen_fd, (struct sockaddr*)&addr, (socklen_t*)&conn_len);
-					
+
 					if (conn_fd < 0) {
 						if (errno == ENFILE) {
 							fprintf(stderr, "out of file descriptor table\n");
@@ -177,20 +306,20 @@ int csiebox_server_run(csiebox_server* server ) {
 				}
 				else{
 					// handle request from connected socket fd
-					
+
 					csiebox_protocol_header check_req ;
 					memset(&check_req,0,sizeof(check_req));
-					
+
 					//fprintf(stderr,"%d\n",i);
 
 					if( recv_message(i,&check_req,sizeof(check_req)) ){
-						
+
 						csiebox_protocol_header check_res ;
 						memset(&check_res,0,sizeof(check_res));
 						check_res.res.magic = CSIEBOX_PROTOCOL_MAGIC_RES;
 						check_res.res.op = 0x78;
-						
-						
+
+
 						//no thread available
 						if(t_pool->count == t_pool->threadnum){
 							check_res.res.status = 0x04 ;
@@ -199,15 +328,15 @@ int csiebox_server_run(csiebox_server* server ) {
 							check_res.res.status = 0x05 ;
 
 							pthread_mutex_lock(&mutex);
-							
+
 							t_pool->argp->conn_fd = i ;
-							
+
 							t_pool->count++;
-							
+
 							pthread_mutex_unlock(&mutex);
-							
+
 							FD_CLR(i, &master) ;
-							
+
 							pthread_cond_signal(&cond);
 						}
 						send_message(i,&check_res,sizeof(check_res));
@@ -224,6 +353,9 @@ int csiebox_server_run(csiebox_server* server ) {
 	}
 	return 1;
 }
+
+
+
 
 void csiebox_server_destroy(csiebox_server** server) {
 	csiebox_server* tmp = *server;
@@ -244,7 +376,7 @@ void csiebox_server_destroy(csiebox_server** server) {
 
 //read config file
 static int parse_arg(csiebox_server* server, int argc, char** argv) {
-	if (argc != 2) {
+	if (argc != 3) {
 		return 0;
 	}
 	FILE* file = fopen(argv[1], "r");
@@ -256,8 +388,8 @@ static int parse_arg(csiebox_server* server, int argc, char** argv) {
 	char* key = (char*)malloc(sizeof(char) * keysize);
 	char* val = (char*)malloc(sizeof(char) * valsize);
 	ssize_t keylen, vallen;
-	int accept_config_total = 3;
-	int accept_config[3] = {0, 0, 0};
+	int accept_config_total = 4;
+	int accept_config[4] = {0, 0, 0, 0};
 	while ((keylen = getdelim(&key, &keysize, '=', file) - 1) > 0) {
 		key[keylen] = '\0';
 		vallen = getline(&val, &valsize, file) - 1;
@@ -277,6 +409,10 @@ static int parse_arg(csiebox_server* server, int argc, char** argv) {
 		else if( strcmp("thread_num",key) == 0 ){
 			server->arg.thread_num = (int)strtol(val,(char**)NULL, 10);
 			accept_config[2] = 1 ;
+		}
+		else if( strcmp("run_path",key) == 0 ){
+			strncpy(server->arg.run_path, val, vallen);
+			accept_config[3] = 1 ;
 		}
 	}
 	free(key);
@@ -605,7 +741,7 @@ static int sync_meta( csiebox_server* server, int conn_fd, csiebox_protocol_meta
 				closedir(dirp);
 				//release lock
 				elock.l_type = F_UNLCK ;
-				
+
 				if( fcntl(fd,F_SETLK,&elock) == -1 ){
 					fprintf(stderr,"fail to unlock\n");
 				}

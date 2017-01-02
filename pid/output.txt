@@ -1,0 +1,20 @@
+/nfs/course/select/b04705018/桌面/MP/MP5/MP4/pid/csiebox_server.15016
+login
+login
+sync meta
+sync meta
+stat fail || no such file
+sync meta
+end of connection
+end of connection
+login
+login
+sync meta
+stat fail || no such file
+sync meta
+stat fail || no such file
+sync meta
+stat fail || no such file
+end of connection
+end of connection
+catch SIGTERM

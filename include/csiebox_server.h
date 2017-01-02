@@ -24,6 +24,7 @@ typedef struct {
     char path[PATH_MAX];
     char account_path[PATH_MAX];
     int thread_num ;
+    char run_path[PATH_MAX];
   } arg;
   int listen_fd;
   csiebox_client_info** client;
